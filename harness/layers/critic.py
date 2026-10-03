@@ -79,16 +79,63 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        observed = ctx.observed_text
+        observed_docs = [
+            doc for doc in ctx.corpus.docs
+            if doc.body and doc.body in observed
+        ] if ctx.corpus is not None else []
+        kept = []
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            if text in observed:
+                kept.append(claim)
+                continue
+
+            pieces = None
+            start = 0
+            while True:
+                split = text.find(" và ", start)
+                if split < 0:
+                    break
+                left, right = text[:split].strip(), text[split + 4:].strip()
+                if not left or not right:
+                    start = split + 1
+                    continue
+                left_doc = next((
+                    doc for doc in observed_docs
+                    if any(left in line for line in doc.body.splitlines())
+                ), None)
+                right_doc = next((
+                    doc for doc in observed_docs
+                    if doc is not left_doc
+                    and any(right in line for line in doc.body.splitlines())
+                ), None)
+                if left in observed and right in observed and left_doc and right_doc:
+                    pieces = ((left, left_doc.doc_id), (right, right_doc.doc_id))
+                    break
+                # +1, không phải +4: " và " có thể chồng lấn ("tuần và và chỉ").
+                start = split + 1
+
+            if pieces:
+                kept.extend({**claim, "text": part, "doc_id": doc_id} for part, doc_id in pieces)
+                report["abstain"] = True
+
+        report["claims"] = kept
+        report["citations"] = sorted({
+            claim["doc_id"]
+            for claim in kept
+            if isinstance(claim.get("doc_id"), str) and claim["doc_id"]
+        })
+        if not kept:
+            report["abstain"] = True
+            report["answer"] = "Không đủ căn cứ trong các tài liệu đã quan sát để trả lời."
+        return report
